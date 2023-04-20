@@ -9,6 +9,9 @@ The repo/script demonstrates a sample encryption technique where KMS data key is
 - Generate output which includes encrypted input value using KMS and public key encrypted KMS plaintext key
 - Decrypt value using KMS and HSM
 
+### Install Localstack
+Follow directions here to install localstack. This provides a local AWS development environment
+https://docs.localstack.cloud/getting-started/installation/
 
 ### Install SoftHSM
 `brew install softhsm`
