@@ -8,11 +8,13 @@ import (
 	"encoding/base64"
 	"encoding/gob"
 	"encoding/pem"
-	"fmt"
+	"errors"
 	"io/ioutil"
 	"log"
 	"math/big"
 	"os"
+	"sync"
+	"unsafe"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/kms"
@@ -25,13 +27,61 @@ import (
 const (
 	keyLength   = 32
 	nonceLength = 24
+	rsaModBits  = 2048
 )
 
 var (
 	kmsClient *kms.KMS
 	p11Func   = pkcs11.New("")
 	session   pkcs11.SessionHandle
+
+	pubKey     *rsa.PublicKey
+	pubKeyOnce sync.Once
+
+	publicTemplate = keyTemplate{
+		token:   true,
+		private: true,
+		encrypt: true,
+		verify:  true,
+		wrap:    true,
+		label:   "pub1",
+	}
+
+	privateTemplate = keyTemplate{
+		token:       true,
+		private:     true,
+		decrypt:     true,
+		sign:        true,
+		unwrap:      true,
+		extractable: false,
+		modifiable:  false,
+		sensitive:   true,
+		label:       "priv1",
+	}
+
+	payloadPool = sync.Pool{
+		New: func() interface{} {
+			return &payload{
+				Nonce: &[nonceLength]byte{},
+			}
+		},
+	}
 )
+
+type keyTemplate struct {
+	token       bool
+	private     bool
+	encrypt     bool
+	verify      bool
+	wrap        bool
+	decrypt     bool
+	sign        bool
+	unwrap      bool
+	extractable bool
+	modifiable  bool
+	sensitive   bool
+	label       string
+}
 
 type payload struct {
 	Key        []byte
@@ -40,44 +90,48 @@ type payload struct {
 	Message    []byte
 }
 
-func checkResult(ret error, message string) {
+func checkError(ret error, message string) {
 	if ret != nil {
-		fmt.Printf("Problem occured during %s : %s\n", message, ret)
+		log.Fatalf("Problem occured during %s : %s\n", message, ret)
 		p11Func.Finalize()
-		os.Exit(0)
+		os.Exit(1)
 	}
 }
 
 func generateRSAKeyPair() (pkcs11.ObjectHandle, pkcs11.ObjectHandle) {
-	var modBits = 2048
-	exp := []byte{0x01, 0x00, 0x00, 0x00, 0x01}
-	publicTemplate := []*pkcs11.Attribute{
-		pkcs11.NewAttribute(pkcs11.CKA_TOKEN, false),
-		pkcs11.NewAttribute(pkcs11.CKA_PRIVATE, true),
-		pkcs11.NewAttribute(pkcs11.CKA_ENCRYPT, true),
-		pkcs11.NewAttribute(pkcs11.CKA_VERIFY, true),
-		pkcs11.NewAttribute(pkcs11.CKA_WRAP, true),
-		pkcs11.NewAttribute(pkcs11.CKA_MODULUS_BITS, modBits),
-		pkcs11.NewAttribute(pkcs11.CKA_PUBLIC_EXPONENT, exp),
-		pkcs11.NewAttribute(pkcs11.CKA_LABEL, "pub1"),
+
+	rsaExponent := []byte{0x01, 0x00, 0x00, 0x00, 0x01}
+
+	pubAttrs := []*pkcs11.Attribute{
+		pkcs11.NewAttribute(pkcs11.CKA_TOKEN, publicTemplate.token),
+		pkcs11.NewAttribute(pkcs11.CKA_PRIVATE, publicTemplate.private),
+		pkcs11.NewAttribute(pkcs11.CKA_ENCRYPT, publicTemplate.encrypt),
+		pkcs11.NewAttribute(pkcs11.CKA_VERIFY, publicTemplate.verify),
+		pkcs11.NewAttribute(pkcs11.CKA_WRAP, publicTemplate.wrap),
+		pkcs11.NewAttribute(pkcs11.CKA_MODULUS_BITS, rsaModBits),
+		pkcs11.NewAttribute(pkcs11.CKA_PUBLIC_EXPONENT, rsaExponent),
+		pkcs11.NewAttribute(pkcs11.CKA_LABEL, publicTemplate.label),
 	}
 
-	privateTemplate := []*pkcs11.Attribute{
-		pkcs11.NewAttribute(pkcs11.CKA_TOKEN, false),
-		pkcs11.NewAttribute(pkcs11.CKA_PRIVATE, true),
-		pkcs11.NewAttribute(pkcs11.CKA_DECRYPT, true),
-		pkcs11.NewAttribute(pkcs11.CKA_SIGN, true),
-		pkcs11.NewAttribute(pkcs11.CKA_UNWRAP, true),
-		pkcs11.NewAttribute(pkcs11.CKA_EXTRACTABLE, false),
-		pkcs11.NewAttribute(pkcs11.CKA_MODIFIABLE, false),
-		pkcs11.NewAttribute(pkcs11.CKA_SENSITIVE, true),
-		pkcs11.NewAttribute(pkcs11.CKA_LABEL, "priv1"),
+	priAttrs := []*pkcs11.Attribute{
+		pkcs11.NewAttribute(pkcs11.CKA_TOKEN, privateTemplate.token),
+		pkcs11.NewAttribute(pkcs11.CKA_PRIVATE, privateTemplate.private),
+		pkcs11.NewAttribute(pkcs11.CKA_DECRYPT, privateTemplate.decrypt),
+		pkcs11.NewAttribute(pkcs11.CKA_SIGN, privateTemplate.sign),
+		pkcs11.NewAttribute(pkcs11.CKA_UNWRAP, privateTemplate.unwrap),
+		pkcs11.NewAttribute(pkcs11.CKA_EXTRACTABLE, privateTemplate.extractable),
+		pkcs11.NewAttribute(pkcs11.CKA_MODIFIABLE, privateTemplate.modifiable),
+		pkcs11.NewAttribute(pkcs11.CKA_SENSITIVE, privateTemplate.sensitive),
+		pkcs11.NewAttribute(pkcs11.CKA_LABEL, privateTemplate.label),
 	}
-	pubKey, priKey, ret := p11Func.GenerateKeyPair(session, []*pkcs11.Mechanism{pkcs11.NewMechanism(pkcs11.CKM_RSA_PKCS_KEY_PAIR_GEN, nil)}, publicTemplate, privateTemplate)
-	checkResult(ret, "GenerateKeyPair")
+
+	pubKey, priKey, err := p11Func.GenerateKeyPair(session, []*pkcs11.Mechanism{pkcs11.NewMechanism(pkcs11.CKM_RSA_PKCS_KEY_PAIR_GEN, nil)}, pubAttrs, priAttrs)
+
+	checkError(err, "p11Func.GenerateKeyPair")
 	log.Println("RSA-2048 keypair generated.")
 	log.Printf("   - Private Key : %d\n", priKey)
 	log.Printf("   - Public Key  : %d\n", pubKey)
+
 	return pubKey, priKey
 }
 
@@ -94,15 +148,15 @@ func exportPubKey() {
 	}
 
 	if err := p11Func.FindObjectsInit(session, publicKeyTemplate); err != nil {
-		panic(err)
+		checkError(err, "FindObjectsInit")
 	}
 
 	pubKeySlice, _, err := p11Func.FindObjects(session, 1)
 	if err != nil {
-		panic(err)
+		checkError(err, "FindObjects")
 	}
 	if err = p11Func.FindObjectsFinal(session); err != nil {
-		panic(err)
+		checkError(err, "FindObjectsFinal")
 	}
 
 	pubKey := pubKeySlice[0]
@@ -111,7 +165,7 @@ func exportPubKey() {
 		pkcs11.NewAttribute(pkcs11.CKA_PUBLIC_EXPONENT, nil),
 	})
 	if err != nil {
-		panic(err)
+		checkError(err, "GetAttributeValue")
 	}
 
 	modulus := new(big.Int)
@@ -125,37 +179,39 @@ func exportPubKey() {
 
 	pubkeyPem := string(pem.EncodeToMemory(&pem.Block{Type: "RSA PUBLIC KEY", Bytes: x509.MarshalPKCS1PublicKey(rsaPub)}))
 	log.Printf("  Public Key: \n%s\n", pubkeyPem)
-	pemfile, err := os.Create("hsm_public.pem")
-	if err != nil {
-		panic(err)
-	}
-	defer pemfile.Close()
 
-	pem.Encode(pemfile, &pem.Block{Type: "RSA PUBLIC KEY", Bytes: x509.MarshalPKCS1PublicKey(rsaPub)})
+	pubKeyPemEncode := pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PUBLIC KEY",
+		Bytes: x509.MarshalPKCS1PublicKey(rsaPub),
+	})
+
+	err = ioutil.WriteFile("hsm_public.pem", pubKeyPemEncode, 0644)
+	checkError(err, "ioutil.WriteFile")
 
 }
 
-func wrapKey(key []byte) []byte {
+func loadPublicKey() {
 	pub, err := ioutil.ReadFile("hsm_public.pem")
-	if err != nil {
-		panic(err)
-	}
+	checkError(err, "ReadPublicFileFromDisk")
+
 	pubPem, _ := pem.Decode(pub)
-	if pubPem == nil {
-		log.Fatal("key is null")
+	if pubPem == nil || pubPem.Bytes == nil {
+		checkError(errors.New("empty Pub Key"), "EmptyOrNullKey")
 	}
 
 	var parsedKey interface{}
 	var ok bool
 
-	if parsedKey, err = x509.ParsePKCS1PublicKey(pubPem.Bytes); err != nil {
-		panic(err)
-	}
+	parsedKey, err = x509.ParsePKCS1PublicKey(pubPem.Bytes)
+	checkError(err, "ParsePKCS1PublicKey")
 
-	var pubKey *rsa.PublicKey
 	if pubKey, ok = parsedKey.(*rsa.PublicKey); !ok {
-		panic(err)
+		checkError(err, "parsedKey")
 	}
+}
+
+func wrapKey(key []byte) []byte {
+	pubKeyOnce.Do(loadPublicKey)
 
 	encryptedBytes, err := rsa.EncryptPKCS1v15(
 		rand.Reader,
@@ -163,42 +219,41 @@ func wrapKey(key []byte) []byte {
 		key,
 	)
 	if err != nil {
-		panic(err)
+		checkError(err, "EncryptPKCS1v15")
 	}
 
 	return encryptedBytes
 }
 
 func kmsEncrypt(plainText []byte) []byte {
-
 	keyId := os.Getenv("KMS_KEY_ID")
 	keySpec := "AES_128"
 	dataKeyInput := kms.GenerateDataKeyInput{KeyId: &keyId, KeySpec: &keySpec}
 
 	dataKeyOutput, err := kmsClient.GenerateDataKey(&dataKeyInput)
 	if err != nil {
-		panic(err)
+		checkError(err, "GenerateDataKey")
 	}
 
-	p := &payload{
-		Key:   dataKeyOutput.CiphertextBlob,
-		Nonce: &[nonceLength]byte{},
-	}
+	p := payloadPool.Get().(*payload)
+	defer payloadPool.Put(p)
 
+	p.Key = dataKeyOutput.CiphertextBlob
 	p.WrappedKey = wrapKey(dataKeyOutput.Plaintext)
 
 	if _, err = rand.Read(p.Nonce[:]); err != nil {
-		panic(err)
+		checkError(err, "rand.Read")
 	}
 
 	key := &[keyLength]byte{}
 	copy(key[:], dataKeyOutput.Plaintext)
 
-	p.Message = secretbox.Seal(p.Message, plainText, p.Nonce, key)
+	p.Message = secretbox.Seal(p.Message[:0], plainText, p.Nonce, key)
 
-	buf := &bytes.Buffer{}
+	// Using a pre-allocated buffer of size 256 to encode the payload struct. Adjust this buffer size depending on use case
+	buf := bytes.NewBuffer(make([]byte, 0, 256))
 	if err := gob.NewEncoder(buf).Encode(p); err != nil {
-		panic(err)
+		checkError(err, "gob.NewEncoder")
 	}
 
 	return buf.Bytes()
@@ -208,21 +263,19 @@ func kmsDecrypt(cipherText []byte) []byte {
 	var p payload
 	gob.NewDecoder(bytes.NewReader(cipherText)).Decode(&p)
 
-	dataKeyOutput1, err := kmsClient.Decrypt(&kms.DecryptInput{
+	dataKeyOutput, err := kmsClient.Decrypt(&kms.DecryptInput{
 		CiphertextBlob: p.Key,
 	})
-	if err != nil {
-		panic(err)
-	}
+	checkError(err, "kmsClient.Decrypt")
 
-	key1 := &[keyLength]byte{}
-	copy(key1[:], dataKeyOutput1.Plaintext)
+	key := &[keyLength]byte{}
+	copy(key[:], dataKeyOutput.Plaintext)
 
-	var plaintext []byte
-	plaintext, ok := secretbox.Open(plaintext, p.Message, p.Nonce, key1)
+	plaintext, ok := secretbox.Open(nil, p.Message, p.Nonce, key)
 	if !ok {
-		panic("Failed to open secretbox")
+		err = errors.New("failed to decrypt message")
 	}
+	checkError(err, "secretbox.Open")
 
 	return plaintext
 }
@@ -231,51 +284,48 @@ func hsmDecrypt(cipherText []byte) []byte {
 	var p payload
 	gob.NewDecoder(bytes.NewReader(cipherText)).Decode(&p)
 
-	privateKeyTemplate := []*pkcs11.Attribute{
+	priAttrs := []*pkcs11.Attribute{
 		pkcs11.NewAttribute(pkcs11.CKA_CLASS, pkcs11.CKO_PRIVATE_KEY),
 		pkcs11.NewAttribute(pkcs11.CKA_KEY_TYPE, pkcs11.CKK_RSA),
-		pkcs11.NewAttribute(pkcs11.CKA_TOKEN, true),
-		pkcs11.NewAttribute(pkcs11.CKA_PRIVATE, true),
-		pkcs11.NewAttribute(pkcs11.CKA_SENSITIVE, true),
-		pkcs11.NewAttribute(pkcs11.CKA_LABEL, "priv1"),
-
-		pkcs11.NewAttribute(pkcs11.CKA_SIGN, true),
-		pkcs11.NewAttribute(pkcs11.CKA_DECRYPT, true),
-
-		pkcs11.NewAttribute(pkcs11.CKA_EXTRACTABLE, false),
-
+		pkcs11.NewAttribute(pkcs11.CKA_TOKEN, privateTemplate.token),
+		pkcs11.NewAttribute(pkcs11.CKA_PRIVATE, privateTemplate.private),
+		pkcs11.NewAttribute(pkcs11.CKA_SENSITIVE, privateTemplate.sensitive),
+		pkcs11.NewAttribute(pkcs11.CKA_LABEL, privateTemplate.label),
+		pkcs11.NewAttribute(pkcs11.CKA_SIGN, privateTemplate.sign),
+		pkcs11.NewAttribute(pkcs11.CKA_DECRYPT, privateTemplate.decrypt),
+		pkcs11.NewAttribute(pkcs11.CKA_EXTRACTABLE, privateTemplate.extractable),
 		pkcs11.NewAttribute(pkcs11.CKA_WRAP_WITH_TRUSTED, false),
 		pkcs11.NewAttribute(pkcs11.CKA_UNWRAP, false),
 	}
 
-	if err := p11Func.FindObjectsInit(session, privateKeyTemplate); err != nil {
-		panic(err)
+	if err := p11Func.FindObjectsInit(session, priAttrs); err != nil {
+		checkError(err, "FindObjectsInit")
 	}
 
 	privKeySlice, _, err := p11Func.FindObjects(session, 1)
 	if err != nil {
-		panic(err)
+		checkError(err, "FindObjects")
 	}
 	if err = p11Func.FindObjectsFinal(session); err != nil {
-		panic(err)
+		checkError(err, "FindObjectsFinal")
 	}
 
 	priKey := privKeySlice[0]
 
 	params := pkcs11.NewOAEPParams(pkcs11.CKM_SHA256, pkcs11.CKG_MGF1_SHA256, pkcs11.CKZ_DATA_SPECIFIED, nil)
 	ret := p11Func.DecryptInit(session, []*pkcs11.Mechanism{pkcs11.NewMechanism(pkcs11.CKM_RSA_PKCS, params)}, priKey)
-	checkResult(ret, "C_DecryptInit")
+
+	checkError(ret, "C_DecryptInit")
 
 	unwrappedKey, ret := p11Func.Decrypt(session, p.WrappedKey)
-	checkResult(ret, "C_Decrypt")
+	checkError(ret, "C_Decrypt")
 
-	key1 := &[keyLength]byte{}
-	copy(key1[:], unwrappedKey)
+	key1 := (*[keyLength]byte)(unsafe.Pointer(&(unwrappedKey)[0]))
 
 	var plaintext []byte
 	plaintext, ok := secretbox.Open(plaintext, p.Message, p.Nonce, key1)
 	if !ok {
-		panic("Failed to open secretbox")
+		checkError(err, "secretbox.Open")
 	}
 
 	return plaintext
@@ -290,13 +340,13 @@ func main() {
 
 	p11Func.Initialize()
 	slot, ret := p11Func.GetSlotList(true)
-	checkResult(ret, "GetSlotList")
+	checkError(ret, "GetSlotList")
 
 	session, ret = p11Func.OpenSession(slot[0], pkcs11.CKF_SERIAL_SESSION|pkcs11.CKF_RW_SESSION)
-	checkResult(ret, "OpenSession")
+	checkError(ret, "OpenSession")
 
 	ret = p11Func.Login(session, pkcs11.CKU_USER, "1234")
-	checkResult(ret, "Login")
+	checkError(ret, "Login")
 	log.Println("Connected to HSM")
 
 	log.Println("Generating RSA Key Pair")
@@ -306,8 +356,8 @@ func main() {
 	exportPubKey()
 
 	log.Println("Initializing KMS Client and Session")
+	// To AWS instead of localstack, change the sess to below line
 	//sess := awssession.Must(awssession.NewSession())
-
 	cfg := aws.Config{
 		Endpoint: aws.String("http://localhost:4566"),
 		Region:   aws.String("us-west-1"),
@@ -318,7 +368,7 @@ func main() {
 	log.Println("KMS Client Initialized")
 
 	log.Println("Calling KMS Encrypt")
-	plainText := []byte("Vishal")
+	plainText := []byte("344543323456643322")
 	cipherText := kmsEncrypt(plainText)
 	log.Println("KMS Encrypted Value", base64.StdEncoding.EncodeToString(cipherText))
 
